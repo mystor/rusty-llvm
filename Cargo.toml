@@ -1,0 +1,5 @@
+[package]
+
+name = "rusty_llvm"
+version = "0.0.1"
+authors = ["Michael Layzell <michael@thelayzells.com>"]
