@@ -23,7 +23,10 @@ pub use ll::{
     AtomicOrdering,
     AtomicBinOp,
     TypeKind,
-    Opcode
+    Opcode,
+    CodeGenModel,
+    CodeGenOptLevel,
+    RelocMode,
 };
 use debuginfo::{DIBuilderRef, DIDescriptor,
                 DIFile, DILexicalBlock, DISubprogram, DIType,
@@ -35,7 +38,7 @@ use debuginfo::{DIBuilderRef, DIDescriptor,
 // which are used in the llvm-c api. They are always passed around by reference,
 // and are cast into the correct type in order to pass them into the C function.
 //
-// The code here looks pretty awful (mem::transmute sucks), but it allows for the
+// The code here is pretty awful (mem::transmute sucks), but it allows for the
 // "more safe" from_ll and as_ll functions to be used in the implementation of methods
 // throughout the file.
 trait LLRef<T> {
@@ -68,9 +71,9 @@ macro_rules! llref_ty{
         }
     };
     ($name:ident <'a> , $llname:ty) => {
-        // An llref_ty is a reference to a c-type. It has an llname
-        // (which is the name used in librustc_llvm), and can be converted
-        // between that and itself
+        // This is for if a created object has a limited lifetime.
+        // For example, if you create a module in a context, it only lives as long
+        // as that context. There are no instances of it currently in the file
         pub enum $name<'a> {}
         impl <'a> $name <'a> {
             #[allow(dead_code)]
@@ -88,6 +91,25 @@ macro_rules! llref_ty{
             #[allow(dead_code)]
             unsafe fn as_ll(&self) -> $llname {
                 mem::transmute(self)
+            }
+        }
+    }
+}
+// Ownable Types have Drop implemented on them, which will call the llvm destructor for the type
+// when the type is dropped. In addition, as they are destructable, they can be cast from their
+// raw pointer form into a Box<$name>, which will call the drop method when they are destroyed.
+macro_rules! llref_ownable_ty{
+    ($name:ident , $llname:ty , $dispose:expr) => {
+        llref_ty!($name, $llname);
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                unsafe { $dispose(self.as_ll()) }
+            }
+        }
+        impl $name {
+            unsafe fn box_from_ll(ll: $llname) -> Box<$name> {
+                mem::transmute(ll)
             }
         }
     }
@@ -113,8 +135,8 @@ fn c_str_to_string(s: *const c_char) -> String {
 
 impl <'a, T: LLRef<U>, U> LLRef<*const U> for [&'a T] {
     unsafe fn as_ll(&self) -> *const U {
-        let vec: Vec<_> = self.iter().map(|x| x.as_ll()).collect();
-        vec.as_ptr()
+        let ptr: *const &'a T = self.as_ptr();
+        mem::transmute(ptr)
     }
 }
 
@@ -159,10 +181,8 @@ impl Type {
         }
     }
     pub fn get_param_types(&self) -> Vec<Option<&Type>> {
-        unsafe {
-            unimplemented!()
-            // ll::LLVMGetParamTypes(self.as_ll(), dest.as_ll())
-        }
+        // TODO(michael): What would the best way be to implement this
+        unimplemented!()
     }
     pub fn count_struct_element_types(&self) -> c_uint {
         unsafe {
@@ -170,10 +190,8 @@ impl Type {
         }
     }
     pub fn get_struct_element_types(&self) -> Vec<Option<&Type>> {
-        unsafe {
-            unimplemented!()
-            // ll::LLVMGetStructElementTypes(self.as_ll(), dest.as_ll())
-        }
+        // TODO(michael): What would be the best way to implement this
+        unimplemented!()
     }
     pub fn is_packed_struct(&self) -> bool {
         unsafe {
@@ -323,16 +341,12 @@ impl Type {
         }
     }
 }
-llref_ty!(ExecutionEngine, ll::ExecutionEngineRef);
+// TODO(michael): You can't create an ExecutionEngine... Weird.
+llref_ownable_ty!(ExecutionEngine, ll::ExecutionEngineRef, ll::LLVMDisposeExecutionEngine);
 impl ExecutionEngine {
     pub fn get_pointer_to_global(&self, v: &Value) -> *const ( ) {
         unsafe {
             ll::LLVMGetPointerToGlobal(self.as_ll(), v.as_ll())
-        }
-    }
-    pub fn dispose_execution_engine(&self) {
-        unsafe {
-            ll::LLVMDisposeExecutionEngine(self.as_ll())
         }
     }
 }
@@ -362,20 +376,15 @@ impl SMDiagnostic {
         }
     }
 }
-llref_ty!(MemoryBuffer, ll::MemoryBufferRef);
+llref_ownable_ty!(MemoryBuffer, ll::MemoryBufferRef, ll::LLVMDisposeMemoryBuffer);
 impl MemoryBuffer {
-    pub fn dispose_memory_buffer(&self) {
+    pub fn create_object_file(&self) -> Box<ObjectFile> {
         unsafe {
-            ll::LLVMDisposeMemoryBuffer(self.as_ll())
-        }
-    }
-    pub fn create_object_file(&self) -> Option<&ObjectFile> {
-        unsafe {
-            ObjectFile::from_ll(ll::LLVMCreateObjectFile(self.as_ll()))
+            ObjectFile::box_from_ll(ll::LLVMCreateObjectFile(self.as_ll()))
         }
     }
 }
-llref_ty!(TargetData, ll::TargetDataRef);
+llref_ownable_ty!(TargetData, ll::TargetDataRef, ll::LLVMDisposeTargetData);
 impl TargetData {
     pub fn add_target_data(&self, pm: &PassManager) {
         unsafe {
@@ -417,19 +426,9 @@ impl TargetData {
             ll::LLVMCallFrameAlignmentOfType(self.as_ll(), ty.as_ll())
         }
     }
-    pub fn dispose_target_data(&self) {
-        unsafe {
-            ll::LLVMDisposeTargetData(self.as_ll())
-        }
-    }
 }
-llref_ty!(PassManager, ll::PassManagerRef);
+llref_ownable_ty!(PassManager, ll::PassManagerRef, ll::LLVMDisposePassManager);
 impl PassManager {
-    pub fn dispose_pass_manager(&self) {
-        unsafe {
-            ll::LLVMDisposePassManager(self.as_ll())
-        }
-    }
     pub fn run_pass_manager(&self, m: &Module) -> bool {
         unsafe {
             from_c_bool(ll::LLVMRunPassManager(self.as_ll(), m.as_ll()))
@@ -651,16 +650,11 @@ impl PassManager {
         }
     }
 }
-llref_ty!(ObjectFile, ll::ObjectFileRef);
+llref_ownable_ty!(ObjectFile, ll::ObjectFileRef, ll::LLVMDisposeObjectFile);
 impl ObjectFile {
-    pub fn dispose_object_file(&self) {
+    pub fn get_sections(&self) -> Box<SectionIterator> {
         unsafe {
-            ll::LLVMDisposeObjectFile(self.as_ll())
-        }
-    }
-    pub fn get_sections(&self) -> Option<&SectionIterator> {
-        unsafe {
-            SectionIterator::from_ll(ll::LLVMGetSections(self.as_ll()))
+            SectionIterator::box_from_ll(ll::LLVMGetSections(self.as_ll()))
         }
     }
     pub fn is_section_iterator_at_end(&self, si: &SectionIterator) -> bool {
@@ -669,7 +663,7 @@ impl ObjectFile {
         }
     }
 }
-llref_ty!(Builder, ll::BuilderRef);
+llref_ownable_ty!(Builder, ll::BuilderRef, ll::LLVMDisposeBuilder);
 impl Builder {
     pub fn position_builder(&self, block: &BasicBlock, instr: &Value) {
         unsafe {
@@ -704,11 +698,6 @@ impl Builder {
     pub fn insert_into_builder_with_name(&self, instr: &Value, name: &str) {
         unsafe {
             ll::LLVMInsertIntoBuilderWithName(self.as_ll(), instr.as_ll(), str_to_c_str(name).as_ptr())
-        }
-    }
-    pub fn dispose_builder(&self) {
-        unsafe {
-            ll::LLVMDisposeBuilder(self.as_ll())
         }
     }
     pub fn set_current_debug_location(&self, l: &Value) {
@@ -1220,11 +1209,13 @@ impl Builder {
 }
 llref_ty!(DiagnosticInfo, ll::DiagnosticInfoRef);
 impl DiagnosticInfo {
-    pub fn unpack_optimization_diagnostic(&self, pass_name_out: *mut *const c_char, function_out: &*mut Value, debugloc_out: &*mut DebugLoc, message_out: &*mut Twine) {
-        unsafe {
-            unimplemented!()
-            // ll::LLVMUnpackOptimizationDiagnostic(self.as_ll(), pass_name_out, function_out.as_ll(), debugloc_out.as_ll(), message_out.as_ll())
-        }
+    pub fn unpack_optimization_diagnostic(&self,
+                                          pass_name_out: *mut *const c_char,
+                                          function_out: *mut ll::ValueRef,
+                                          debugloc_out: *mut ll::DebugLocRef,
+                                          message_out: *mut ll::TwineRef) {
+        // TODO(michael): I'm not sure what this function does, so I'm not sure how to implement it
+        unimplemented!()
     }
     pub fn write_diagnostic_info_to_string(&self, s: &RustString) {
         unsafe {
@@ -1242,13 +1233,8 @@ impl DiagnosticInfo {
         }
     }
 }
-llref_ty!(DIBuilder, DIBuilderRef);
+llref_ownable_ty!(DIBuilder, DIBuilderRef, ll::LLVMDIBuilderDispose);
 impl DIBuilder {
-    pub fn di_builder_dispose(&self) {
-        unsafe {
-            ll::LLVMDIBuilderDispose(self.as_ll())
-        }
-    }
     pub fn di_builder_finalize(&self) {
         unsafe {
             ll::LLVMDIBuilderFinalize(self.as_ll())
@@ -1431,13 +1417,8 @@ impl DIBuilder {
         }
     }
 }
-llref_ty!(Context, ll::ContextRef);
+llref_ownable_ty!(Context, ll::ContextRef, ll::LLVMContextDispose);
 impl Context {
-    pub fn context_dispose(&self) {
-        unsafe {
-            ll::LLVMContextDispose(self.as_ll())
-        }
-    }
     pub fn get_md_kind_id_in_context(&self, name: &str, s_len: c_uint) -> c_uint {
         unsafe {
             ll::LLVMGetMDKindIDInContext(self.as_ll(), str_to_c_str(name).as_ptr(), s_len)
@@ -1565,9 +1546,9 @@ impl Context {
             BasicBlock::from_ll(ll::LLVMInsertBasicBlockInContext(self.as_ll(), bb.as_ll(), str_to_c_str(name).as_ptr()))
         }
     }
-    pub fn create_builder_in_context(&self) -> Option<&Builder> {
+    pub fn create_builder_in_context(&self) -> Box<Builder> {
         unsafe {
-            Builder::from_ll(ll::LLVMCreateBuilderInContext(self.as_ll()))
+            Builder::box_from_ll(ll::LLVMCreateBuilderInContext(self.as_ll()))
         }
     }
     pub fn struct_create_named(&self, name: &str) -> Option<&Type> {
@@ -1599,13 +1580,8 @@ impl Twine {
         }
     }
 }
-llref_ty!(TargetMachine, ll::TargetMachineRef);
+llref_ownable_ty!(TargetMachine, ll::TargetMachineRef, ll::LLVMRustDisposeTargetMachine);
 impl TargetMachine {
-    pub fn rust_dispose_target_machine(&self) {
-        unsafe {
-            ll::LLVMRustDisposeTargetMachine(self.as_ll())
-        }
-    }
     pub fn rust_add_analysis_passes(&self, pm: &PassManager, m: &Module) {
         unsafe {
             ll::LLVMRustAddAnalysisPasses(self.as_ll(), pm.as_ll(), m.as_ll())
@@ -1639,6 +1615,7 @@ impl BasicBlock {
             BasicBlock::from_ll(ll::LLVMGetPreviousBasicBlock(self.as_ll()))
         }
     }
+    // TODO(michael): Is this a dispose method? How should I deal with it...
     pub fn delete_basic_block(&self) {
         unsafe {
             ll::LLVMDeleteBasicBlock(self.as_ll())
@@ -2207,10 +2184,8 @@ impl Value {
         }
     }
     pub fn get_params(&self) -> Vec<Option<&Value>> {
-        unsafe {
-            unimplemented!()
-            // ll::LLVMGetParams(self.as_ll(), params.as_ll())
-        }
+        // TODO(michael): What would the best way be to implement this
+        unimplemented!()
     }
     pub fn get_param(&self, index: c_uint) -> Option<&Value> {
         unsafe {
@@ -2278,10 +2253,8 @@ impl Value {
         }
     }
     pub fn get_basic_blocks(&self) -> Vec<Option<&Value>> {
-        unsafe {
-            unimplemented!()
-            // ll::LLVMGetBasicBlocks(self.as_ll(), basic_blocks.as_ll())
-        }
+        // TODO(michael): What would the best way be to implement this
+        unimplemented!()
     }
     pub fn get_first_basic_block(&self) -> Option<&BasicBlock> {
         unsafe {
@@ -2484,13 +2457,8 @@ impl Archive {
         }
     }
 }
-llref_ty!(SectionIterator, ll::SectionIteratorRef);
+llref_ownable_ty!(SectionIterator, ll::SectionIteratorRef, ll::LLVMDisposeSectionIterator);
 impl SectionIterator {
-    pub fn dispose_section_iterator(&self) {
-        unsafe {
-            ll::LLVMDisposeSectionIterator(self.as_ll())
-        }
-    }
     pub fn move_to_next_section(&self) {
         unsafe {
             ll::LLVMMoveToNextSection(self.as_ll())
@@ -2512,13 +2480,8 @@ impl SectionIterator {
         }
     }
 }
-llref_ty!(PassManagerBuilder, ll::PassManagerBuilderRef);
+llref_ownable_ty!(PassManagerBuilder, ll::PassManagerBuilderRef, ll::LLVMPassManagerBuilderDispose);
 impl PassManagerBuilder {
-    pub fn pass_manager_builder_dispose(&self) {
-        unsafe {
-            ll::LLVMPassManagerBuilderDispose(self.as_ll())
-        }
-    }
     pub fn pass_manager_builder_set_opt_level(&self, optimization_level: c_uint) {
         unsafe {
             ll::LLVMPassManagerBuilderSetOptLevel(self.as_ll(), optimization_level)
@@ -2575,16 +2538,11 @@ impl PassManagerBuilder {
         }
     }
 }
-llref_ty!(Module, ll::ModuleRef);
+llref_ownable_ty!(Module, ll::ModuleRef, ll::LLVMDisposeModule);
 impl Module {
     pub fn get_module_context(&self) -> Option<&Context> {
         unsafe {
             Context::from_ll(ll::LLVMGetModuleContext(self.as_ll()))
-        }
-    }
-    pub fn dispose_module(&self) {
-        unsafe {
-            ll::LLVMDisposeModule(self.as_ll())
         }
     }
     pub fn get_data_layout(&self) -> String {
@@ -2692,9 +2650,9 @@ impl Module {
             ll::LLVMRustAddModuleFlag(self.as_ll(), str_to_c_str(name).as_ptr(), value)
         }
     }
-    pub fn di_builder_create(&self) -> Option<&DIBuilder> {
+    pub fn di_builder_create(&self) -> Box<DIBuilder> {
         unsafe {
-            DIBuilder::from_ll(ll::LLVMDIBuilderCreate(self.as_ll()))
+            DIBuilder::box_from_ll(ll::LLVMDIBuilderCreate(self.as_ll()))
         }
     }
     pub fn rust_set_normalized_target(&self, triple: &str) {
@@ -2721,518 +2679,193 @@ impl Module {
 llref_ty!(RustString, ll::RustStringRef);
 llref_ty!(DebugLoc, ll::DebugLocRef);
 
-
-
-
-// // Opaque enum (represents data from llvm)
-// // This is identical to llvm::opaque_Context, execpt it is defined
-// // in our crate so we can define Drop for it.
-// llref_ty!(Context, ll::LLVMContextRef);
-// impl Context {
-//     pub fn new() -> Box<Context> {
-//         unsafe { mem::transmute(ll::LLVMLLVMContextCreate()) }
-//     }
-
-//     pub fn get_md_kind_id(&self, name: &str) -> c_uint {
-//         let (name_p, name_l) = explode_str(name);
-//         unsafe { ll::LLVMLLVMGetMDKindIDInContext(self.as_ll(), name_p, name_l) }
-//     }
-
-//     // Create a module inside the context.
-//     pub fn create_module<'a> (&'a self, name: &str) -> Box<Module<'a>> {
-//         let name = CString::from_slice(name.as_bytes());
-//         unsafe {
-//             let mref: ll::LLVMModuleRef = ll::LLVMLLVMModuleCreateWithNameInContext(name.as_ptr(),
-//                                                                             self.as_ll());
-//             mem::transmute(mref)
-//         }
-//     }
-
-//     pub fn int1_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMInt1TypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn int8_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMInt8TypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn int16_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMInt16TypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn int32_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMInt32TypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn int64_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMInt64TypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn int_type<'a> (&'a self, num_bits: u32) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMIntTypeInContext(self.as_ll(), num_bits)).unwrap()
-//         }
-//     }
-
-//     pub fn float_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMFloatTypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn double_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMDoubleTypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn x86fp80_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMX86FP80TypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn fp128_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMFP128TypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn ppcfp128_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMPPCFP128TypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn function_type<'a> (&'a self, // NOTE(michael): Technically unnecessary
-//                               return_type: &Type,
-//                               param_type: &[&Type],
-//                               var_arg: bool) -> &'a Type {
-//         unsafe {
-//             let return_type = return_type.as_ll();
-//             let param_type: Vec<_> = param_type.iter().map(|x| x.as_ll()).collect();
-
-//             Type::from_ll(ll::LLVMLLVMFunctionType(return_type,
-//                                                param_type.as_ptr(),
-//                                                param_type.len() as u32,
-//                                                to_c_bool(var_arg))).unwrap()
-//         }
-//     }
-
-//     pub fn struct_type<'a> (&'a self,
-//                             element_types: &[&Type],
-//                             packed: bool) -> &'a Type {
-//         unsafe {
-//             let element_types: Vec<_> = element_types.iter().map(|x| x.as_ll()).collect();
-
-//             Type::from_ll(ll::LLVMLLVMStructTypeInContext(self.as_ll(),
-//                                                       element_types.as_ptr(),
-//                                                       element_types.len() as u32,
-//                                                       to_c_bool(packed))).unwrap()
-//         }
-//     }
-
-//     #[unstable = "rustc_llvm specific"]
-//     pub fn rust_array_type<'a> (&'a self, // NOTE(michael): Unnecessary
-//                                 element_type: &Type,
-//                                 element_count: u64) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMRustArrayType(element_type.as_ll(), element_count)).unwrap()
-//         }
-//     }
-
-//     pub fn pointer_type<'a> (&'a self,
-//                              element_type: &Type,
-//                              address_space: u32) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMPointerType(element_type.as_ll(), address_space)).unwrap()
-//         }
-//     }
-
-//     pub fn vector_type<'a> (&'a self,
-//                             element_type: &Type,
-//                             element_count: u32) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMVectorType(element_type.as_ll(), element_count)).unwrap()
-//         }
-//     }
-
-//     pub fn void_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMVoidTypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn label_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMLabelTypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn metadata_type<'a> (&'a self) -> &'a Type {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMMetadataTypeInContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn md_string(&self, s: &str) -> Option<&Value> {
-//         let (s_p, s_l) = explode_str(s);
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMMDStringInContext(self.as_ll(),
-//                                                      s_p,
-//                                                      s_l))
-//         }
-//     }
-
-//     pub fn md_node(&self, vals: &[&Value]) -> Option<&Value> {
-//         unsafe {
-//             let vals: Vec<_> = vals.iter().map(|x| x.as_ll()).collect();
-
-//             Value::from_ll(ll::LLVMLLVMMDNodeInContext(self.as_ll(),
-//                                                    vals.as_ptr(),
-//                                                    vals.len() as u32))
-//         }
-//     }
-// }
-
-// impl Drop for Context {
-//     fn drop(&mut self) {
-//         unsafe {
-//             ll::LLVMLLVMContextDispose(self.as_ll());
-//         }
-//     }
-// }
-
-// llref_ty!(Module<'a>, ll::LLVMModuleRef);
-// impl <'a> Module<'a> {
-//     pub fn get_context(&self) -> &'a Context {
-//         unsafe {
-//             Context::from_ll(ll::LLVMLLVMGetModuleContext(self.as_ll())).unwrap()
-//         }
-//     }
-
-//     pub fn get_data_layout(&self) -> String {
-//         format!("{}", unsafe {
-//             from_c_str(ll::LLVMLLVMGetDataLayout(self.as_ll()))
-//         })
-//     }
-
-//     pub fn set_data_layout(&self, triple: &str) {
-//         let triple = CString::from_slice(triple.as_bytes());
-//         unsafe {
-//             ll::LLVMLLVMSetDataLayout(self.as_ll(), triple.as_ptr())
-//         }
-//     }
-
-//     pub fn get_target(&self) -> String {
-//         format!("{}", unsafe {
-//             from_c_str(ll::LLVMLLVMGetTarget(self.as_ll()))
-//         })
-//     }
-
-//     pub fn set_target(&self, triple: &str) {
-//         let triple = CString::from_slice(triple.as_bytes());
-//         unsafe {
-//             ll::LLVMLLVMSetTarget(self.as_ll(), triple.as_ptr())
-//         }
-//     }
-
-//     pub fn dump(&self) {
-//         unsafe { ll::LLVMLLVMDumpModule(self.as_ll()) }
-//     }
-
-//     pub fn set_module_inline_asm(&self, asm: &str) {
-//         let asm = CString::from_slice(asm.as_bytes());
-//         unsafe {
-//             ll::LLVMLLVMSetModuleInlineAsm(self.as_ll(), asm.as_ptr())
-//         }
-//     }
-
-//     pub fn add_named_metadata_operand(&self, s: &str, val: &Value) {
-//         let name = CString::from_slice(s.as_bytes());
-//         unsafe {
-//             ll::LLVMLLVMAddNamedMetadataOperand(self.as_ll(),
-//                                             name.as_ptr(),
-//                                             val.as_ll())
-//         }
-//     }
-// }
-
-// #[unsafe_destructor]
-// impl<'a> Drop for Module<'a> {
-//     fn drop(&mut self) {
-//         unsafe {
-//             ll::LLVMLLVMDisposeModule(self.as_ll())
-//         }
-//     }
-// }
-
-// llref_ty!(Type, ll::LLVMTypeRef);
-// impl Type {
-//     pub fn get_kind(&self) -> ll::LLVMTypeKind { // TODO(michael): re-export TypeKind
-//         unsafe { ll::LLVMLLVMGetTypeKind(self.as_ll()) }
-//     }
-
-//     pub fn get_context(&self) -> &Context {
-//         unsafe { mem::transmute(ll::LLVMLLVMGetTypeContext(self.as_ll())) }
-//     }
-
-//     /* ONLY_SHOULD_WORK_ON_INT_TYPES */
-//     pub fn get_int_type_width(&self) -> u32 {
-//         unsafe {
-//             ll::LLVMLLVMGetIntTypeWidth(self.as_ll())
-//         }
-//     }
-
-//     /* ONLY_SHOULD_WORK_ON_FUNCTION_TYPES */
-//     pub fn is_function_var_arg(&self) -> bool {
-//         unsafe {
-//             ll::LLVMLLVMIsFunctionVarArg(self.as_ll()) != ll::LLVMFalse
-//         }
-//     }
-
-//     pub fn get_return_type(&self) -> Option<&Type> {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMGetReturnType(self.as_ll()))
-//         }
-//     }
-
-//     pub fn count_param_types(&self) -> u32 {
-//         unsafe {
-//             ll::LLVMLLVMCountParamTypes(self.as_ll())
-//         }
-//     }
-
-//     pub fn get_param_types(&self) -> Vec<&Type> {
-//         // TODO(michael): Implement
-//         unimplemented!()
-//     }
-
-//     /* ONLY_SHOULD_WORK_ON_STRUCT_TYPES */
-//     pub fn count_struct_element_types(&self) -> u32 {
-//         unsafe {
-//             ll::LLVMLLVMCountStructElementTypes(self.as_ll())
-//         }
-//     }
-
-//     pub fn get_struct_element_types(&self) -> Vec<&Type> {
-//         unimplemented!()
-//     }
-
-//     pub fn is_packed_struct(&self) -> bool {
-//         unsafe {
-//             ll::LLVMLLVMIsPackedStruct(self.as_ll()) != ll::LLVMFalse
-//         }
-//     }
-
-//     /* ONLY_SHOULD_WORK_ON_ARRAY_POINTER_AND_VECTOR_TYPES */
-//     pub fn get_element_type(&self) -> Option<&Type> {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMGetElementType(self.as_ll()))
-//         }
-//     }
-
-//     pub fn get_array_length(&self) -> u32 {
-//         unsafe {
-//             ll::LLVMLLVMGetArrayLength(self.as_ll())
-//         }
-//     }
-
-//     pub fn get_pointer_address_space(&self) -> u32 {
-//         unsafe {
-//             ll::LLVMLLVMGetPointerAddressSpace(self.as_ll())
-//         }
-//     }
-
-//     pub fn get_vector_size(&self) -> u32 {
-//         unsafe {
-//             ll::LLVMLLVMGetVectorSize(self.as_ll())
-//         }
-//     }
-// }
-
-// llref_ty!(Value, ll::LLVMValueRef);
-// impl Value {
-//     pub fn type_of(&self) -> Option<&Type> {
-//         unsafe {
-//             Type::from_ll(ll::LLVMLLVMTypeOf(self.as_ll()))
-//         }
-//     }
-
-//     pub fn get_name(&self) -> String {
-//         format!("{}", unsafe {
-//             from_c_str(ll::LLVMLLVMGetValueName(self.as_ll()))
-//         })
-//     }
-
-//     pub fn set_name(&self, name: &str) {
-//         let name = CString::from_slice(name.as_bytes());
-//         unsafe {
-//             ll::LLVMLLVMSetValueName(self.as_ll(), name.as_ptr())
-//         }
-//     }
-
-//     pub fn dump(&self) {
-//         unsafe {
-//             ll::LLVMLLVMDumpValue(self.as_ll())
-//         }
-//     }
-
-//     pub fn replace_all_uses_with(&self, new_val: &Value) {
-//         unsafe {
-//             ll::LLVMLLVMReplaceAllUsesWith(self.as_ll(), new_val.as_ll())
-//         }
-//     }
-
-//     pub fn has_metadata(&self) -> i32 { // TODO(michael): Maybe should be bool?
-//         unsafe {
-//             ll::LLVMLLVMHasMetadata(self.as_ll())
-//         }
-//     }
-
-//     pub fn get_metadata(&self, kind_id: u32) -> Option<&Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMGetMetadata(self.as_ll(), kind_id))
-//         }
-//     }
-
-//     pub fn set_metadata(&self, kind_id: u32, node: &Value) {
-//         unsafe {
-//            ll::LLVMLLVMSetMetadata(self.as_ll(), kind_id, node.as_ll())
-//         }
-//     }
-
-//     /* Operations on Users */
-//     pub fn get_num_operands(&self) -> i32 {
-//         unsafe {
-//             ll::LLVMLLVMGetNumOperands(self.as_ll())
-//         }
-//     }
-
-//     pub fn get_operand(&self, index: u32) -> Option<&Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMGetOperand(self.as_ll(), index))
-//         }
-//     }
-
-//     pub fn set_operand(&self, index: u32, op: &Value) {
-//         unsafe {
-//             ll::LLVMLLVMSetOperand(self.as_ll(), index, op.as_ll())
-//         }
-//     }
-
-//     pub fn get_first_use(&self) -> Option<&Use> {
-//         unsafe {
-//             Use::from_ll(ll::LLVMLLVMGetFirstUse(self.as_ll()))
-//         }
-//     }
-
-//     pub fn is_constant(&self) -> bool {
-//         unsafe {
-//             ll::LLVMLLVMIsConstant(self.as_ll()) != ll::LLVMFalse
-//         }
-//     }
-
-//     pub fn is_null(&self) -> bool {
-//         unsafe {
-//             ll::LLVMLLVMIsNull(self.as_ll()) != ll::LLVMFalse
-//         }
-//     }
-
-//     pub fn is_undef(&self) -> bool {
-//         unsafe {
-//             ll::LLVMLLVMIsUndef(self.as_ll()) != ll::LLVMFalse
-//         }
-//     }
-
-//     // STATIC
-
-//     // TODO(michael): Should these be a member function on Type?
-//     pub fn const_null(ty: &Type) -> Option<&Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMConstNull(ty.as_ll()))
-//         }
-//     }
-
-//     pub fn const_all_ones(ty: &Type) -> Option<&Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMConstAllOnes(ty.as_ll()))
-//         }
-//     }
-
-//     pub fn get_undef(ty: &Type) -> Option<&Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMGetUndef(ty.as_ll()))
-//         }
-//     }
-
-//     pub fn const_pointer_null(ty: &Type) -> Option<&Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMConstPointerNull(ty.as_ll()))
-//         }
-//     }
-
-//     pub fn const_int(int_ty: &Type, n: u64, sign_extend: bool) -> Option<&Value> { // LAST!!
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMConstInt(int_ty.as_ll(), n, to_c_bool(sign_extend)))
-//         }
-//     }
-
-//     pub fn const_icmp<'a> (pred: u16, v1: &'a Value, v2: &'a Value) -> Option<&'a Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMConstICmp(pred, v1.as_ll(), v2.as_ll()))
-//         }
-//     }
-
-//     pub fn const_fcmp<'a> (pred: u16, v1: &'a Value, v2: &'a Value) -> Option<&'a Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMConstFCmp(pred, v1.as_ll(), v2.as_ll()))
-//         }
-//     }
-
-//     /* only for int/vector */
-// }
-
-// llref_ty!(ExecutionEngine, ll::LLVMExecutionEngineRef);
-// impl ExecutionEngine {
-//     pub fn get_pointer_to_global(&self, v: &Value) -> *const () {
-//         unsafe {
-//             ll::LLVMLLVMGetPointerToGlobal(self.as_ll(), v.as_ll())
-//         }
-//     }
-// }
-
-// llref_ty!(Use, ll::LLVMUseRef);
-// impl Use {
-//     pub fn get_next(&self) -> Option<&Use> {
-//         unsafe {
-//             Use::from_ll(ll::LLVMLLVMGetNextUse(self.as_ll()))
-//         }
-//     }
-
-//     pub fn get_user(&self) -> Option<&Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMGetUser(self.as_ll()))
-//         }
-//     }
-
-//     pub fn get_used_value(&self) -> Option<&Value> {
-//         unsafe {
-//             Value::from_ll(ll::LLVMLLVMGetUser(self.as_ll()))
-//         }
-//     }
-// }
-
-// #[test]
-// fn it_works() {
-// }
+pub fn context_create() -> Box<Context> {
+    unsafe {
+        Context::box_from_ll(ll::LLVMContextCreate())
+    }
+}
+pub fn module_create_with_name_in_context(module_id: &str, c: &Context) -> Box<Module> {
+    unsafe {
+        Module::box_from_ll(ll::LLVMModuleCreateWithNameInContext(str_to_c_str(module_id).as_ptr(), c.as_ll()))
+    }
+}
+pub fn const_i_cmp(pred: c_ushort, v1: &Value, v2: &Value) -> Option<&'static Value> {
+    unsafe {
+        Value::from_ll(ll::LLVMConstICmp(pred, v1.as_ll(), v2.as_ll()))
+    }
+}
+pub fn const_f_cmp(pred: c_ushort, v1: &Value, v2: &Value) -> Option<&'static Value> {
+    unsafe {
+        Value::from_ll(ll::LLVMConstFCmp(pred, v1.as_ll(), v2.as_ll()))
+    }
+}
+pub fn const_vector(scalar_constant_vals: &[&Value]) -> Option<&'static Value> {
+    unsafe {
+        Value::from_ll(ll::LLVMConstVector(scalar_constant_vals.as_ll(), scalar_constant_vals.len() as u32))
+    }
+}
+pub fn create_target_data(string_rep: &str) -> Box<TargetData> {
+    unsafe {
+        TargetData::box_from_ll(ll::LLVMCreateTargetData(str_to_c_str(string_rep).as_ptr()))
+    }
+}
+pub fn create_pass_manager() -> Box<PassManager> {
+    unsafe {
+        PassManager::box_from_ll(ll::LLVMCreatePassManager())
+    }
+}
+pub fn initialize_passes() {
+    unsafe {
+        ll::LLVMInitializePasses()
+    }
+}
+pub fn pass_manager_builder_create() -> Box<PassManagerBuilder> {
+    unsafe {
+        PassManagerBuilder::box_from_ll(ll::LLVMPassManagerBuilderCreate())
+    }
+}
+pub fn rust_create_memory_buffer_with_contents_of_file(path: &str) -> Box<MemoryBuffer> {
+    unsafe {
+        MemoryBuffer::box_from_ll(ll::LLVMRustCreateMemoryBufferWithContentsOfFile(str_to_c_str(path).as_ptr()))
+    }
+}
+pub fn create_memory_buffer_with_memory_range(input_data: &str, input_data_length: size_t, buffer_name: &str, requires_null: bool) -> Box<MemoryBuffer> {
+    unsafe {
+        MemoryBuffer::box_from_ll(ll::LLVMCreateMemoryBufferWithMemoryRange(str_to_c_str(input_data).as_ptr(), input_data_length, str_to_c_str(buffer_name).as_ptr(), to_c_bool(requires_null)))
+    }
+}
+pub fn create_memory_buffer_with_memory_range_copy(input_data: &str, input_data_length: size_t, buffer_name: &str) -> Box<MemoryBuffer> {
+    unsafe {
+        MemoryBuffer::box_from_ll(ll::LLVMCreateMemoryBufferWithMemoryRangeCopy(str_to_c_str(input_data).as_ptr(), input_data_length, str_to_c_str(buffer_name).as_ptr()))
+    }
+}
+pub fn is_multithreaded() -> bool {
+    unsafe {
+        from_c_bool(ll::LLVMIsMultithreaded())
+    }
+}
+pub fn start_multithreaded() -> bool {
+    unsafe {
+        from_c_bool(ll::LLVMStartMultithreaded())
+    }
+}
+pub fn rust_get_last_error() -> String {
+    unsafe {
+        c_str_to_string(ll::LLVMRustGetLastError())
+    }
+}
+pub fn rust_print_pass_timings() {
+    unsafe {
+        ll::LLVMRustPrintPassTimings()
+    }
+}
+pub fn set_debug(enabled: c_int) {
+    unsafe {
+        ll::LLVMSetDebug(enabled)
+    }
+}
+pub fn initialize_x86_target_info() {
+    unsafe {
+        ll::LLVMInitializeX86TargetInfo()
+    }
+}
+pub fn initialize_x86_target() {
+    unsafe {
+        ll::LLVMInitializeX86Target()
+    }
+}
+pub fn initialize_x86_target_mc() {
+    unsafe {
+        ll::LLVMInitializeX86TargetMC()
+    }
+}
+pub fn initialize_x86_asm_printer() {
+    unsafe {
+        ll::LLVMInitializeX86AsmPrinter()
+    }
+}
+pub fn initialize_x86_asm_parser() {
+    unsafe {
+        ll::LLVMInitializeX86AsmParser()
+    }
+}
+pub fn initialize_arm_target_info() {
+    unsafe {
+        ll::LLVMInitializeARMTargetInfo()
+    }
+}
+pub fn initialize_arm_target() {
+    unsafe {
+        ll::LLVMInitializeARMTarget()
+    }
+}
+pub fn initialize_arm_target_mc() {
+    unsafe {
+        ll::LLVMInitializeARMTargetMC()
+    }
+}
+pub fn initialize_arm_asm_printer() {
+    unsafe {
+        ll::LLVMInitializeARMAsmPrinter()
+    }
+}
+pub fn initialize_arm_asm_parser() {
+    unsafe {
+        ll::LLVMInitializeARMAsmParser()
+    }
+}
+pub fn initialize_mips_target_info() {
+    unsafe {
+        ll::LLVMInitializeMipsTargetInfo()
+    }
+}
+pub fn initialize_mips_target() {
+    unsafe {
+        ll::LLVMInitializeMipsTarget()
+    }
+}
+pub fn initialize_mips_target_mc() {
+    unsafe {
+        ll::LLVMInitializeMipsTargetMC()
+    }
+}
+pub fn initialize_mips_asm_printer() {
+    unsafe {
+        ll::LLVMInitializeMipsAsmPrinter()
+    }
+}
+pub fn initialize_mips_asm_parser() {
+    unsafe {
+        ll::LLVMInitializeMipsAsmParser()
+    }
+}
+pub fn rust_create_target_machine(triple: &str, cpu: &str, features: &str, model: CodeGenModel, reloc: RelocMode, level: CodeGenOptLevel, enable_segstk: bool, use_soft_fp: bool, no_frame_pointer_elim: bool, position_independent_executable: bool, function_sections: bool, data_sections: bool) -> Box<TargetMachine> {
+    unsafe {
+        TargetMachine::box_from_ll(ll::LLVMRustCreateTargetMachine(str_to_c_str(triple).as_ptr(), str_to_c_str(cpu).as_ptr(), str_to_c_str(features).as_ptr(), model, reloc, level, enable_segstk, use_soft_fp, no_frame_pointer_elim, position_independent_executable, function_sections, data_sections))
+    }
+}
+pub fn rust_set_llvm_options(argc: c_int, argv: *const *const c_char) {
+    unsafe {
+        ll::LLVMRustSetLLVMOptions(argc, argv)
+    }
+}
+pub fn rust_print_passes() {
+    unsafe {
+        ll::LLVMRustPrintPasses()
+    }
+}
+pub fn rust_open_archive(path: &str) -> Option<&Archive> {
+    unsafe {
+        Archive::from_ll(ll::LLVMRustOpenArchive(str_to_c_str(path).as_ptr()))
+    }
+}
+pub fn version_major() -> c_int {
+    unsafe {
+        ll::LLVMVersionMajor()
+    }
+}
+pub fn version_minor() -> c_int {
+    unsafe {
+        ll::LLVMVersionMinor()
+    }
+}
